@@ -16,6 +16,7 @@ If the user does not say which mode, run Audit first and offer Retrofit for the 
 ## Ground rules
 
 - Audit may run local commands and fault injection only in a disposable copy: clone from the repository's local path into a separate directory outside it, remove the clone's remote, then work offline. Do not use a `git worktree` (which writes into the audited repository's `.git`). A network deny is an optional extra. Read each repository script before running it. Run with no credentials or push access in the environment, including credential helpers and SSH agents. Audit never pushes. Propose challenges that need platform CI; execute them only as a separately approved push. Until observed, label that control "configured only" and use `UNEVAL` for unproved behaviour.
+- Local runs: if the CI's interpreter or tool version is not installed locally, use the nearest one and label every local result with the version used. Cap every local run's time. macOS has no `timeout`; a portable cap is `perl -e 'alarm 600; exec @ARGV' -- COMMAND ARGS` (change 600 to the seconds allowed; the command is killed when time runs out).
 - Inspect before proposing. Read the CI config, test runner config, scripts and docs before suggesting any change.
 - A control's verdict must be deterministic: same inputs, same answer. No language-model judgement inside a verdict. AI review can be *evidence* a control checks; it cannot be the control.
 - Every control returns one of: `PASS`, `FAIL`, `UNEVAL` (could not establish the answer), `N/A` (known not applicable, with a reason). Missing information is `UNEVAL`, never `PASS` and never silently dropped.
@@ -35,6 +36,7 @@ Collect, and cite file paths for, everything below:
 - Saved or generated artifacts that later steps reuse: coverage reports, generated docs or inventories, snapshots, lockfiles, SBOMs.
 - Any policy file that lists required checks, and the script that evaluates it.
 - Platform enforcement, if the user permits API access: read both classic branch protection (`gh api repos/OWNER/REPO/branches/BRANCH/protection`) and rulesets (`gh api repos/OWNER/REPO/rules/branches/BRANCH`). These are separate; the repo-level branch rules call includes organization rules that apply to that branch. If not permitted, record `UNEVAL` and an open question.
+- Who can bypass the gate: the `bypass_actors` list of each active ruleset (`gh api repos/OWNER/REPO/rulesets`, then `gh api repos/OWNER/REPO/rulesets/RULESET_ID`). GitHub returns `bypass_actors` only to a caller with write access to the ruleset, so a successful read that omits the field is `UNEVAL`, not an empty list; do not ask for wider permissions in Audit mode. Also count the accounts with push access and, separately, with admin access, across all result pages, counting only accounts whose `permissions` show it (for example `gh api --paginate --slurp repos/OWNER/REPO/collaborators | jq '[.[][] | select(.permissions.push == true)] | length'`, and `.permissions.admin` for admins; `--jq` runs once per page and prints page-local counts). Record counts, not names. A count alone does not prove bypass authority: relate it to the active rules and their bypass lists. A refused read is `UNEVAL`.
 - Read the response message: a protection HTTP 404 explicitly saying the branch is not protected (observed API behaviour, not documented message text) is `FAIL` evidence for missing classic protection, not proof that rulesets are absent. HTTP 403 or any other HTTP 404 is `UNEVAL` (could not check), not evidence of an absent control.
 
 ## Step 1 — Draw the evidence path
@@ -47,9 +49,9 @@ Note which rules judge the decision and where they are loaded from. Note what ha
 
 ## Step 2 — Pick merge requirements
 
-Choose the requirements that matter most (start with one). For each, state what must be true, e.g. "the reused coverage report describes the current source set" or "every applicable suite passed for the PR head commit".
+Choose the requirements that matter most. Start with one; add a second only when a control would otherwise have nothing to test (for example a generated artifact, so Control 1 has something to check). Then stop. For each, state what must be true, e.g. "the reused coverage report describes the current source set" or "every applicable suite passed for the PR head commit".
 
-Keep one record per merge requirement. Map all five controls to each requirement and record each control's verdict, including justified `N/A`. Roll up applicable verdicts with the worst winning: `FAIL > UNEVAL > PASS`; if all five are `N/A`, the requirement is `N/A` with a reason.
+Keep one record per merge requirement. Map each control to each requirement and record its verdict. A control that cannot apply to a requirement (for example Control 1 when no saved artifact is reused) is `N/A` with a reason; do not force all five. Roll up applicable verdicts with the worst winning: `FAIL > UNEVAL > PASS`; if all five are `N/A`, the requirement is `N/A` with a reason.
 
 ## Step 3 — Check the five control families
 
@@ -86,8 +88,9 @@ Probe:
 - PR audit: list added or changed test files (`git diff --name-only --diff-filter=AMR BASE...HEAD`). Compare them with the union of what the registered PR jobs collect.
 - Branch audit: enumerate every tracked test file (`git ls-files`, using the project's test-file conventions). Compare with the union of what each applicable job collects, not just the PR diff.
 - Run each job's exact command in the shell the job uses (for example the workflow's `shell:` setting), not your interactive shell, using the runner's list mode (`pytest --collect-only -q ...`, `jest --listTests ...`, `go test -list . ...`). A plausible count does not prove the flags applied; cross-check with one path the job should exclude, or record why none exists.
+- A framework with no list mode (for example Python `unittest`): count by calling the same discovery the CI uses (same loader, start folder and file pattern) and print the count. Compare it with the count in a CI log.
 Pattern: a CI check that fails when an in-scope test file is collected by no applicable job. A collection or import error is UNEVAL, not "no route". Exceptions live in a reviewed file with path, reason, owner and expiry.
-Challenge: add a test under an unselected directory (expect FAIL); add one under a selected directory (expect PASS); add one with a broken import (expect UNEVAL).
+Challenge: add a test under an unselected directory (expect FAIL); add one under a selected directory (expect PASS); add one with a broken import (expect UNEVAL); make the selection empty (expect not PASS: a runner that prints "0 tests ... OK" and exits 0 must not count as a pass).
 Limit: collection is not execution. The audited PR or branch must also trigger each counted job, and the job must run.
 
 ### 4. Required CI results
@@ -96,11 +99,13 @@ Question: did every applicable suite pass for the intended commit, judged by rul
 Faults: a success from another commit or older attempt counts; a missing suite is treated as fine; the PR edits the policy or evaluator to drop its own failing requirement.
 **Probe:**
 - Is there one aggregate gate? Where does its policy come from? Does it match results by head SHA, event, current run attempt and current Ready cycle? Is it required by branch protection or rulesets? Which required jobs can skip or conclude neutral?
-- A Ready cycle starts when the PR is opened non-draft, or at its latest `ready_for_review` event if it was ever a draft; it ends when the PR returns to draft (`convert_to_draft`) or closes. A non-draft PR with a complete history and no `ready_for_review` event has been ready since opening, not `UNEVAL`; a `reopened` event starts a new Ready cycle, excluding time while closed.
+- No gate and no required status at all: Control 4 is `FAIL` (absent). List the Ready-cycle and run-attempt checks under "Not checked": with nothing that consumes them, they cannot change the verdict.
+- A Ready cycle starts when the PR is opened non-draft, or at its latest `ready_for_review` event if it was ever a draft; it ends when the PR returns to draft (`convert_to_draft`) or closes. A non-draft PR with a complete history and no `ready_for_review` event has been ready since opening, not `UNEVAL`; a `reopened` event starts a new Ready cycle, excluding time while closed. A PR reopened while still a draft starts no cycle until it is marked ready (`ready_for_review`).
 - Read `gh api --paginate repos/OWNER/REPO/issues/NUMBER/events` and PR metadata (`gh api repos/OWNER/REPO/pulls/NUMBER`) for opening time and draft state; compare cycle boundaries with run creation/start times. Missing metadata or incomplete history is `UNEVAL`.
 
 **Platform facts:**
-- Under `pull_request`, GitHub runs the workflow definition from the PR itself, so a PR can change its own gate.
+- Under `pull_request`, GitHub runs the workflow definition from the PR itself, so a PR can change its own gate. Under `push`, it runs the definition from the pushed commit, so a push can change its own gate too; a gate that runs only on `push` is not safe for that reason.
+- A commit whose message holds a CI-skip marker (`[skip ci]`, `[ci skip]`, `[no ci]`, `[skip actions]`, `[actions skip]`) starts no `push` or `pull_request` run: for `push` the marker counts in the pushed commit's message, for `pull_request` only in the PR's head commit message. GitHub documents this for those two events only; do not assume it stops other events such as `pull_request_target`. Without a required status, those skipped runs leave no barrier to merging that commit (other restrictions may still apply). Check whether the project's own scripts add such markers.
 - On GitHub, a job skipped by a job-level `if:` reports success for branch protection without running. A workflow not triggered because of path or branch filtering leaves required checks pending and blocks merging. GitHub also accepts skipped and neutral check conclusions; platform acceptance alone is not proof a required suite executed.
 - An aggregate gate job that `needs:` suite jobs can itself be skipped after a suite fails. Use `if: always()` so the gate runs and fails unless every needed result is `success`, or have an independent gate read results through the API.
 
@@ -117,17 +122,20 @@ Dependency challenge: make one suite job fail and confirm the aggregate gate rep
 
 ### 5. Workflow effect
 
-Question: does a failing check actually change the merge decision?
+Question: does a failing command make its step, its job and the check the job reports fail?
+Scope: this control judges the chain command exit -> step -> job conclusion -> reported check. Whether that check is required, and so changes the merge decision, is Control 4's finding. Do not count it again here.
 Fault: a command fails, but the step, job or pipeline is configured to continue, so the job ends green.
-Probe: search CI and scripts for `continue-on-error`, `allow_failure` (GitLab), `catchError` / `unstable` (Jenkins), `|| true`, `set +e`, `--exit-zero`, `if: always()` on gating steps, and pipes without `pipefail` (`cmd | tee log`). For each hit, trace: command exit -> step -> job conclusion -> required status -> branch protection. Record whether the advisory effect is intentional and documented.
+Probe: search CI and scripts for `continue-on-error`, `allow_failure` (GitLab), `catchError` / `unstable` (Jenkins), `|| true`, `set +e`, `--exit-zero`, `if: always()` on gating steps, and pipes without `pipefail` (`cmd | tee log`). For each hit, trace the chain above. Record whether the advisory effect is intentional and documented.
 Pattern: make the intended effect explicit per check and event. If a finding must block, remove the continuation for that event or route the finding into the aggregate gate. Never flip an intentionally advisory check to blocking (or the reverse) without approval.
-Challenge: propose injecting a failure into the command on a disposable branch and checking that the job and required status both turn red on events that should block. Running this through platform CI needs explicit approval for the push; Audit does not push.
+Challenge: propose injecting a failure into the command on a disposable branch and checking that the job and its reported check both turn red on events that should block. Running this through platform CI needs explicit approval for the push; Audit does not push.
 
 ### Observed history (read-only)
 
 With permitted API read access, run these reads from the auditor's normal environment, not the offline copy. This is observed evidence for the five controls, mainly Control 4, not a sixth control; place findings in Step 5's evidence path, challenge and verdict fields.
 
 Sample merged PRs and their check rollups (`gh pr list --state merged --json number,mergedAt,headRefOid,statusCheckRollup`) and recent default-branch push runs (`gh run list --branch BRANCH --event push`). Record the sample window and commit/run IDs. Compare run completion times with merge times; a rollup read today does not prove what was visible at merge.
+
+Also list the default-branch commits that did not come from a PR (compare `git log --first-parent BRANCH` with the merged-PR list, or ask `gh api repos/OWNER/REPO/commits/SHA/pulls`) and the commits with a CI-skip marker in the message. Record what each touched (`git diff-tree --no-commit-id --name-only -r SHA`). Group repeated automated commits by subject and touched paths instead of listing each one.
 
 For red runs, read the suite step's conclusion (`gh api repos/OWNER/REPO/actions/jobs/JOB_ID`; get `JOB_ID` from `gh api repos/OWNER/REPO/actions/runs/RUN_ID/jobs`, which lists the run's jobs and their ids), not just the job conclusion or a step count. Use logs to distinguish test failures from infrastructure failures; cancelled/skipped tests or failed setup do not prove a test failed. Leave unclear causes `UNEVAL`.
 
@@ -144,7 +152,7 @@ Write the worksheet outside the audited repository unless the user asks for it i
 - **Overall verdict:** PASS / FAIL / UNEVAL / N/A; the same roll-up rule applies across requirements: `FAIL > UNEVAL > PASS` (all N/A needs a reason).
 - **Not checked:** each omitted read or challenge, why, and who can resolve it.
 
-Include one row per merge requirement, with all five control verdicts and Step 2's roll-up:
+Include one row per merge requirement, with each control's verdict (`N/A` with a reason where a control cannot apply) and Step 2's roll-up:
 
 | Field | Content |
 |---|---|
