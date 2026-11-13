@@ -1,0 +1,3 @@
+{"intent": "checks passed - safe to merge?", "expected_skill": "cicd-evidence-audit"}
+{"intent": "audit our CI gates", "expected_skill": "cicd-evidence-audit"}
+{"intent": "retrofit CI evidence controls", "expected_skill": "cicd-evidence-audit"}
