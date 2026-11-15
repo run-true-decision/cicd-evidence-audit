@@ -15,14 +15,14 @@ If the user does not say which mode, run Audit first and offer Retrofit for the 
 
 ## Ground rules
 
-- Audit may run local commands and fault injection only in a disposable copy: clone from the repository's local path into a separate directory outside it, remove the clone's remote, explicitly check out the audited SHA and verify `HEAD` equals it before any probe, then work offline. Do not use a `git worktree` (which writes into the audited repository's `.git`). A network deny is an optional extra. Read each repository script before running it. Run with no credentials or push access in the environment, including credential helpers and SSH agents. Audit never pushes. Propose challenges that need platform CI; execute them only as a separately approved push.
+- Audit may run local commands and fault injection only in a disposable copy: clone from the repository's local path into a separate directory outside it, remove the clone's remote (also removes `origin/*` refs some tests expect), pin the audited SHA with `git switch --detach <sha>` and verify `HEAD` equals it before any probe, then work offline. Do not use a `git worktree` (which writes into the audited repository's `.git`). A network deny is an optional extra. Read each repository script before running it. Run with no credentials or push access in the environment, including credential helpers and SSH agents. Removing the remote does not remove user-configured helpers; run probes with `env -i`, `GIT_CONFIG_NOSYSTEM=1`, an empty `HOME` directory and a minimal `PATH`. Under that environment, `git config --show-origin --get-all credential.helper` must print nothing. Audit never pushes. Propose challenges that need platform CI; execute them only as a separately approved push.
 - Local runs: if the CI's interpreter or tool version is not installed locally, use the nearest one and label every local result with the version used. Cap every local run's time. macOS has no `timeout`; a portable cap is `perl -e 'alarm 600; exec @ARGV' -- COMMAND ARGS` (change 600 to the seconds allowed; the command is killed when time runs out).
 - Inspect before proposing. Read the CI config, test runner config, scripts and docs before suggesting any change.
 - A control's verdict must be deterministic: same inputs, same answer. No language-model judgement inside a verdict. AI review can be *evidence* a control checks; it cannot be the control.
 - Every control returns one of: `PASS`, `FAIL`, `UNEVAL` (could not establish the answer), `N/A` (known not applicable, with a reason). Missing information is `UNEVAL`, never `PASS` and never silently dropped.
 - A documented platform weakness that applies to the configuration you read, but cannot be challenged read-only, is `FAIL`, labelled "configured only, not challenged". Use `UNEVAL` instead only when the configuration itself cannot be read.
 - A guard (a check enforcing the pattern) that meets only part of the pattern is `FAIL (partial guard)`; name every missing part (for example "no owner", "no expiry").
-- For each requirement, grade each finding in exactly one control: the one whose question it answers. Other controls use `N/A` (see Control N), rather than counting it again.
+- For each requirement, grade each finding in exactly one control: the one whose question it answers. Other controls use `N/A` (see Control N), rather than counting it again. Findings outside all five controls instead go in Step 5's ungraded "Also found" list.
 - An absent control is `FAIL` ("absent") where the failure can happen; it is `N/A` with a reason only where the failure cannot happen.
 - Never weaken a gate to get green: do not delete required checks, add `continue-on-error`, `|| true`, `--exit-zero`, skip markers or exceptions without saying so explicitly and getting approval.
 - Do not change branch protection, rulesets, secrets, or push/merge without the user's explicit approval for that specific action.
@@ -53,7 +53,7 @@ Note which rules judge the decision and where they are loaded from. Note what ha
 
 ## Step 2 — Pick merge requirements
 
-Choose the requirements that matter most. Start with one; add a second only when a control would otherwise have nothing to test (for example a generated artifact, so Control 1 has something to check). A second requirement chosen only to exercise Control 1 is a probe of Control 1, not a real merge gate; label it so. Then stop. For each, state what must be true, e.g. "the reused coverage report describes the current source set" or "every applicable suite passed for the PR head commit".
+Choose the requirements that matter most. Start with one; add a second only when a control would otherwise have nothing to test (for example a generated artifact, so Control 1 has something to check). A second requirement chosen only to exercise Control 1 is a probe of Control 1, not a real merge gate; label it so. Include probes in the overall roll-up; count a finding shared with a real requirement once in the ranked gap list in Step 5. Then stop. For each, state what must be true, e.g. "the reused coverage report describes the current source set" or "every applicable suite passed for the PR head commit".
 
 Keep one record per merge requirement. Map each control to each requirement and record its verdict. A control that cannot apply to a requirement (for example Control 1 when no saved artifact is reused) is `N/A` with a reason; do not force all five. Roll up applicable verdicts with the worst winning: `FAIL > UNEVAL > PASS`; if all five are `N/A`, the requirement is `N/A` with a reason.
 
@@ -76,7 +76,7 @@ Limit: freshness proves which inputs the artifact belongs to. It does not repeat
 
 Question: is the evidence about this commit, and did every required check answer?
 Faults: evidence or approval for commit A reused for local commit B; a check crashes before its verdict and disappears from the summary.
-Probe: is there any local flow (a script, a skill, a bot, a documented habit) that produces a "checks passed" claim? If yes and there is no preflight, grade `FAIL` (absent); if none, grade `N/A` with that reason. Is there a local script that runs fast checks? Does it keep a required-check list independent of returned results? Does it compare `git rev-parse HEAD` with the PR head (`gh pr view --json headRefOid -q .headRefOid`)? What does its exit code mean, and does the caller stop on non-zero?
+Probe: is there any local flow (a script, a skill, a bot, a documented habit) that produces a "checks passed" claim? An agent skill that merges after "checks passed" is a local flow. If yes and there is no preflight, grade `FAIL` (absent); if none, grade `N/A` with that reason. Is there a local script that runs fast checks? Does it keep a required-check list independent of returned results? Does it compare `git rev-parse HEAD` with the PR head (`gh pr view --json headRefOid -q .headRefOid`)? What does its exit code mean, and does the caller stop on non-zero?
 Pattern:
 - A required-check list; each check emits one verdict line; the summary adds `UNEVAL` for any required check with no verdict.
 - Exit codes: `0` all pass or justified N/A; `1` a completed FAIL in strict mode; `3` any UNEVAL (takes priority within the script's own exit-code contract, separate from the audit roll-up). Default mode may be advisory, but say so in the output.
@@ -90,12 +90,13 @@ Question: does a triggered CI job actually select each in-scope test?
 Fault: a test passes when run directly but sits outside every CI job's selection.
 Probe:
 - PR audit: list added or changed test files (`git diff --name-only --diff-filter=AMR BASE...HEAD`). Compare them with the union of what the registered PR jobs collect.
-- Branch audit: enumerate every tracked test file (`git ls-files`, using the project's test-file conventions). Compare with the union of what each applicable job collects, not just the PR diff.
+- Branch audit: enumerate every tracked test file (`git ls-files`, using the project's test-file conventions). Compare with the union of what each applicable job collects, not just the PR diff. For path-filtered jobs, use the selection they collect when they run, and state that assumption.
+- Collection and discovery import modules; read their module-level code, including imported repository modules, before running either.
 - Run each job's exact command in the shell the job uses (for example the workflow's `shell:` setting), not your interactive shell, using the runner's list mode (`pytest --collect-only -q ...`, `jest --listTests ...`, `go test -list . ...`). A plausible count does not prove the flags applied; cross-check with one path the job should exclude, or record why none exists.
 - A framework with no list mode (for example Python `unittest`): count by calling the same discovery the CI uses (same loader, start folder and file pattern) and print the count. Compare it with the count in a CI log.
-Pattern: a CI check that fails when an in-scope test file is collected by no applicable job. A collection or import error is UNEVAL, not "no route". Exceptions live in a reviewed file with path, reason, owner and expiry.
+Pattern: a CI check that fails when an in-scope test file is collected by no applicable job. A collection or import error is UNEVAL, not "no route". Exceptions, including tests deselected by a marker, live in a reviewed file with path, reason, owner and expiry. A test-count floor alone is `FAIL (partial guard)`: it can miss a dropped file while the count stays above the floor.
 Challenge: add a test under an unselected directory (expect FAIL); add one under a selected directory (expect PASS); add one with a broken import (expect UNEVAL); make the selection empty (expect not PASS: a runner that prints "0 tests ... OK" and exits 0 must not count as a pass).
-Limit: collection is not execution. The audited PR or branch must also trigger each counted job, and the job must run.
+Limit: collection is not execution. The audited PR or branch must also trigger each counted job, and the job must run. This also limits the path-filtered-job assumption above: coverage is conditional on that job being triggered and running.
 
 ### 4. Required CI results
 
@@ -114,6 +115,7 @@ Faults: a success from another commit or older attempt counts; a missing suite i
 
 **How to grade:**
 - For an applicable platform weakness above, apply the Ground rules grade: `FAIL`, "configured only, not challenged".
+- With squash or rebase merges, record the checked PR head and the landed SHA separately; PR-head checks do not establish a pass for the landed commit.
 - No gate and no required status at all: Control 4 is `FAIL` (absent). List the Ready-cycle and run-attempt checks under "Not checked": with nothing that consumes them, they cannot change the verdict.
 - A gate that exists but does not depend on the Ready cycle is `FAIL (partial guard)` for that check, noting the missing Ready-cycle check. From sampled history, report whether any merge actually relied on draft-stage evidence; that fact goes in the note and does not change the grade.
 
@@ -124,6 +126,7 @@ Faults: a success from another commit or older attempt counts; a missing suite i
 - Never interpolate PR-controlled titles, bodies or branch names into `run:` scripts. Pass them as data, not executable shell text, and never evaluate them.
 - Treat artifacts downloaded from a PR run as untrusted data. Validate their structure and association with the intended commit and run; never execute or source them.
 - Each required suite must execute and appear exactly once for the head SHA, event, current attempt and current Ready cycle, and conclude success. Missing, skipped or neutral evidence means FAIL or UNEVAL, never PASS. A success from the draft stage does not establish ready-stage execution.
+- Usually, add `ready_for_review` to the PR trigger types to start a run for the current Ready cycle.
 - Policy changes are tested by normal jobs on the PR, and take effect only after an authorized merge.
 Challenge: required suite fails (expect gate FAIL); required suite absent (expect not PASS); required job skips (expect gate FAIL or UNEVAL, never PASS); old success for a previous SHA, event, attempt or Ready cycle only (expect not PASS); PR deletes the failing suite from its own policy copy (expect gate still FAIL).
 Dependency challenge: make one suite job fail and confirm the aggregate gate reports failure, not skipped.
@@ -131,21 +134,21 @@ Dependency challenge: make one suite job fail and confirm the aggregate gate rep
 ### 5. Workflow effect
 
 Question: does a failing command make its step, its job and the check the job reports fail?
-Scope: this control judges the chain command exit -> step -> job conclusion -> reported check. Whether that check is required, and so changes the merge decision, is Control 4's finding. Mark that finding `N/A (see Control 4)`; that does not make this control `N/A`, which still answers its own question.
+Scope: this control judges the chain command exit -> step -> job conclusion -> reported check. Whether that check is required, and so changes the merge decision, is Control 4's finding. Mark that finding `N/A (see Control 4)`; this control, which still answers its own question, is not `N/A`.
 Fault: a command fails, but the step, job or pipeline is configured to continue, so the job ends green.
 Probe: search CI and scripts for `continue-on-error`, `allow_failure` (GitLab), `catchError` / `unstable` (Jenkins), `|| true`, `set +e`, `--exit-zero`, `if: always()` on gating steps, and pipes without `pipefail` (`cmd | tee log`). For each hit, trace the chain above. Record whether the advisory effect is intentional and documented.
 Pattern: make the intended effect explicit per check and event. If a finding must block, remove the continuation for that event or route the finding into the aggregate gate. Never flip an intentionally advisory check to blocking (or the reverse) without approval.
-Challenge: propose injecting a failure into the command on a disposable branch and checking that the job and its reported check both turn red on events that should block. Running this through platform CI needs explicit approval for the push; Audit does not push.
+Challenge: propose injecting a failure into the command on a disposable branch and checking that the job and its reported check both turn red on events that should block. Running this through platform CI needs explicit approval for the push; Audit does not push. If that challenge is not allowed and no documented platform weakness applies, grade `PASS` when source inspection plus local valid/fault/missing runs with the same shell flags show the expected behaviour; label it local evidence, not platform enforcement. If the step cannot run locally, grade `UNEVAL` with that reason.
 
 ### Observed history (read-only)
 
-With permitted API read access, run these reads from the auditor's normal environment, not the offline copy. This is observed evidence for the five controls, mainly Control 4, not a sixth control; place findings in Step 5's evidence path, challenge and verdict fields.
+With permitted API read access, run these reads from the auditor's normal environment, not the offline copy. This is observed evidence for the five controls, mainly Control 4, not a sixth control; record findings in Step 5's evidence path, challenge and verdict fields. You may add a separate observed-history section linked to the relevant requirements.
 
 Sample merged PRs and their check rollups (`gh pr list --state merged --json number,mergedAt,headRefOid,statusCheckRollup`) and recent default-branch push runs (`gh run list --branch BRANCH --event push`). Record the sample window and commit/run IDs. Compare run completion times with merge times; a rollup read today does not prove what was visible at merge.
 
 Read each relevant ruleset's `created_at` and `updated_at`. Count sampled merges before and after its creation; merges before the rule existed are not evidence that it protects merges. Record updates as limits on what the sample proves about the current configuration. Classic branch protection has no `created_at`; record its age as `UNEVAL`.
 
-Also list the default-branch commits that did not come from a PR (compare `git log --first-parent BRANCH` with the merged-PR list, or ask `gh api repos/OWNER/REPO/commits/SHA/pulls`) and the commits with a CI-skip marker in the message. Record what each touched (`git diff-tree --no-commit-id --name-only -r SHA`). Group repeated automated commits by subject and touched paths instead of listing each one.
+Also list the default-branch commits that did not come from a PR and those with a CI-skip marker in the message. Compare the audited SHA with the platform branch head (`gh api repos/OWNER/REPO/commits/BRANCH`); record a mismatch and continue, since auditing an older commit is valid. Use `git log --first-parent AUDITED_SHA`, not a possibly stale local branch. Ask `gh api repos/OWNER/REPO/commits/SHA/pulls`; an empty list means "no PR", not missing output. Do not trust a PR number in the commit subject. Record what each touched (`git diff-tree --no-commit-id --name-only -r SHA`). Group repeated automated commits by subject and touched paths instead of listing each one.
 
 For red runs, read the run-level job listing (`gh api --paginate 'repos/OWNER/REPO/actions/runs/RUN_ID/jobs?filter=all'`; `filter=all` includes earlier attempts) and the suite step's conclusion there, not only the single-job endpoint, the job conclusion or a step count. A failed or cancelled job with no steps is `UNEVAL`. Use logs to distinguish test failures from infrastructure failures; cancelled/skipped tests or failed setup do not prove a test failed. Expired logs (HTTP 410, observed API behaviour, not documented for log downloads) are `UNEVAL`, with that reason. Leave unclear causes `UNEVAL`.
 
@@ -177,7 +180,9 @@ Include one row per merge requirement, with each control's verdict (`N/A` with a
 | Open question and owner | What remains unproved and who resolves it |
 | Revisit trigger | Code, tests, selection, policy or trigger changes that require a re-audit |
 
-End with a ranked gap list (blocking first: highest risk that a failure can reach the default branch unnoticed) and, for Retrofit, one proposed PR per gap: files to change, the challenge tests it adds, and the risk of the change.
+You may add an ungraded "Also found" list for findings outside all five controls. You may add a separate observed-history section linked to the relevant requirements.
+
+End with a ranked gap list (blocking first: highest risk that a failure can reach the default branch unnoticed), including serious "Also found" items without a control grade. For Retrofit, add one proposed PR per gap: files to change, the challenge tests it adds, and the risk of the change.
 
 ## Reporting language
 
