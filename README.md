@@ -6,7 +6,7 @@ Audit CI/CD merge evidence and retrofit five controls: source comparison, local 
 
 1. Turn on code execution in Settings → Capabilities.
 2. Download [cicd-evidence-audit.zip](https://github.com/run-true-decision/cicd-evidence-audit/releases/latest/download/cicd-evidence-audit.zip) from the latest release.
-3. Go to Customize → Skills → "+" → "Create skill" → "Upload a skill" and upload the zip.
+3. Go to Plugins → Add → "Upload plugin" and choose the zip.
 
 ## Install in Claude Code
 
